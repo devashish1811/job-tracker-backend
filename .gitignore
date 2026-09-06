@@ -1,0 +1,9 @@
+target/
+*.jar
+*.class
+data/
+.mvn/
+!.mvn/wrapper/
+*.log
+.env
+application-local.properties
