@@ -65,6 +65,9 @@ public class JobDTOs {
         private String status;
         private String companyName;
         private String positionName;
+        private String jobIdFromPortal;
+        private String jobLink;
+        private String portalName;
     }
 
     @Data
@@ -81,5 +84,9 @@ public class JobDTOs {
         private String jobLink;
         private boolean duplicate;
         private Long existingJobId;
+        // true when the extraction is low-confidence (site blocked automated reading,
+        // fields fell back to generic values) — caller should NOT auto-save this and
+        // should instead let the user review/complete the details manually.
+        private boolean needsReview;
     }
 }

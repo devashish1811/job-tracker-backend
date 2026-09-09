@@ -74,6 +74,13 @@ public class JobService {
         // Extract job data from URL
         JobDTOs.ExtractedJobData extracted = extractorService.extract(url);
 
+        // Low-confidence extraction (site blocked automated reading) — don't silently
+        // save incomplete/garbage data. Hand it back to the user to review and complete.
+        if (extracted.isNeedsReview()) {
+            extracted.setJobLink(url);
+            return ResponseEntity.ok(extracted);
+        }
+
         // Check duplicate by portal job ID
         if (extracted.getJobIdFromPortal() != null) {
             Optional<JobEntity> existingById = jobRepository.findByUserIdAndJobIdFromPortal(userId, extracted.getJobIdFromPortal());
@@ -149,6 +156,9 @@ public class JobService {
         if (request.getStatus() != null) job.setStatus(request.getStatus());
         if (request.getCompanyName() != null) job.setCompanyName(request.getCompanyName());
         if (request.getPositionName() != null) job.setPositionName(request.getPositionName());
+        if (request.getJobIdFromPortal() != null) job.setJobIdFromPortal(request.getJobIdFromPortal());
+        if (request.getJobLink() != null) job.setJobLink(request.getJobLink());
+        if (request.getPortalName() != null) job.setPortalName(request.getPortalName());
 
         return ResponseEntity.ok(JobDTOs.JobResponse.from(jobRepository.save(job)));
     }

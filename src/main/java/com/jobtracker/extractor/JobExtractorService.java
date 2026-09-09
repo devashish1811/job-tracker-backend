@@ -1,13 +1,18 @@
 package com.jobtracker.extractor;
 
 import com.jobtracker.job.JobDTOs;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import com.gargoylesoftware.htmlunit.WebClient;
+import com.gargoylesoftware.htmlunit.html.HtmlPage;
 
 import java.io.IOException;
 import java.net.URI;
@@ -20,6 +25,7 @@ public class JobExtractorService {
 
     private static final Logger log = LoggerFactory.getLogger(JobExtractorService.class);
     private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
      * Main extraction method — detects portal and delegates to specific extractor
@@ -30,38 +36,104 @@ public class JobExtractorService {
 
         log.info("Extracting job from: {} (domain: {})", normalizedUrl, domain);
 
+        JobDTOs.ExtractedJobData result;
         try {
             if (domain.contains("greenhouse.io")) {
-                return extractGreenhouse(normalizedUrl);
+                result = extractGreenhouse(normalizedUrl);
             } else if (domain.contains("lever.co")) {
-                return extractLever(normalizedUrl);
+                result = extractLever(normalizedUrl);
             } else if (domain.contains("linkedin.com")) {
-                return extractLinkedIn(normalizedUrl);
+                result = extractLinkedIn(normalizedUrl);
             } else if (domain.contains("naukri.com")) {
-                return extractWithJsoup(normalizedUrl, "Naukri");
+                result = extractWithJsoup(normalizedUrl, "Naukri");
             } else if (domain.contains("indeed.com")) {
-                return extractIndeed(normalizedUrl);
+                result = extractIndeed(normalizedUrl);
             } else if (domain.contains("workday.com") || domain.contains("myworkdayjobs.com")) {
-                return extractWithJsoup(normalizedUrl, "Workday");
+                result = extractWithJsoup(normalizedUrl, "Workday");
             } else if (domain.contains("smartrecruiters.com")) {
-                return extractSmartRecruiters(normalizedUrl);
+                result = extractSmartRecruiters(normalizedUrl);
             } else if (domain.contains("jobvite.com")) {
-                return extractWithJsoup(normalizedUrl, "Jobvite");
+                result = extractWithJsoup(normalizedUrl, "Jobvite");
+            } else if (domain.contains("microsoft.com") || domain.contains("careers.microsoft.com")) {
+                result = extractMicrosoft(normalizedUrl);
+            } else if (domain.contains("google.com") || domain.contains("careers.google.com")) {
+                result = extractWithJsoup(normalizedUrl, "Google");
+            } else if (domain.contains("amazon.jobs") || domain.contains("amazon.com")) {
+                result = extractWithJsoup(normalizedUrl, "Amazon");
             } else {
-                // Generic fallback — works for most company career pages
-                return extractGeneric(normalizedUrl);
+                result = extractGeneric(normalizedUrl);
             }
         } catch (Exception e) {
-            log.error("Extraction failed for {}: {}", normalizedUrl, e.getMessage());
-            // Return partial data with just the URL
-            return buildPartial(normalizedUrl, "Unknown", "Unknown", extractDomain(normalizedUrl), generateJobId(normalizedUrl));
+            // Even on a total failure, try to pull a real ID out of the URL structure
+            // before resorting to a meaningless hash.
+            log.error("Extraction failed for {}: {} — trying URL-based fallback", normalizedUrl, e.getMessage());
+            String fallbackId = extractJobIdFromUrl(normalizedUrl);
+            result = buildPartial(normalizedUrl, "Unknown", "Unknown", extractDomain(normalizedUrl), fallbackId);
+        }
+
+        // Flag low-confidence results (bot-blocked pages, missing fields, generated hash IDs)
+        // so the caller does NOT silently save junk data — the user gets to review/complete it instead.
+        result.setNeedsReview(isLowConfidence(result));
+        return result;
+    }
+
+    /**
+     * A result is "low confidence" — and should be handed to the user for manual
+     * review rather than auto-saved — when key fields fell back to generic placeholders.
+     * This happens when a site's bot-protection blocked the real page content.
+     */
+    private boolean isLowConfidence(JobDTOs.ExtractedJobData data) {
+        if (data.getPositionName() == null || data.getPositionName().equalsIgnoreCase("Unknown Position")) return true;
+        if (data.getJobIdFromPortal() == null || data.getJobIdFromPortal().startsWith("JOB-")) return true;
+        if (data.getCompanyName() == null || data.getCompanyName().equalsIgnoreCase("Unknown")) return true;
+        return false;
+    }
+
+    // ─── MICROSOFT ────────────────────────────────────────────────────────────────
+    private JobDTOs.ExtractedJobData extractMicrosoft(String url) {
+        try {
+            // New Microsoft careers site (apply.careers.microsoft.com) is a JS SPA —
+            // the internal URL number is NOT the displayed job ID. Call its real
+            // JSON API to get the actual "displayJobId" (e.g. 200043634).
+            if (url.contains("apply.careers.microsoft.com")) {
+                Pattern p = Pattern.compile("job/(\\d+)");
+                Matcher m = p.matcher(url);
+                if (m.find()) {
+                    String internalId = m.group(1);
+                    String apiUrl = "https://apply.careers.microsoft.com/api/pcsx/position_details?position_id="
+                            + internalId + "&domain=microsoft.com&hl=en";
+                    try {
+                        @SuppressWarnings("unchecked")
+                        java.util.Map<String, Object> response = restTemplate.getForObject(apiUrl, java.util.Map.class);
+                        if (response != null && response.get("data") instanceof java.util.Map) {
+                            @SuppressWarnings("unchecked")
+                            java.util.Map<String, Object> data = (java.util.Map<String, Object>) response.get("data");
+                            String displayJobId = (String) data.getOrDefault("displayJobId", data.get("atsJobId"));
+                            String title = (String) data.getOrDefault("name", "Unknown Position");
+                            if (displayJobId != null && isValidJobId(displayJobId)) {
+                                log.info("Microsoft API found real job ID: {}", displayJobId);
+                                return build(url, "Microsoft", title, "Microsoft", displayJobId);
+                            }
+                        }
+                    } catch (Exception apiEx) {
+                        log.warn("Microsoft PCSX API failed, falling back to page scrape: {}", apiEx.getMessage());
+                    }
+                    return extractWithJsoup(url, "Microsoft", null, "Microsoft");
+                }
+            }
+            // Older careers.microsoft.com URLs: https://careers.microsoft.com/us/en/job/1234567/Title
+            Pattern p = Pattern.compile("job/(\\d+)");
+            Matcher m = p.matcher(url);
+            String jobId = m.find() ? m.group(1) : null;
+            return extractWithJsoup(url, "Microsoft", jobId, "Microsoft");
+        } catch (Exception e) {
+            return extractWithJsoup(url, "Microsoft");
         }
     }
 
-    // ─── GREENHOUSE ──────────────────────────────────────────────────────────────
+    // ─── GREENHOUSE ───────────────────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractGreenhouse(String url) {
         try {
-            // URL format: https://boards.greenhouse.io/{company}/jobs/{jobId}
             Pattern p = Pattern.compile("greenhouse\\.io/([^/]+)/jobs/(\\d+)");
             Matcher m = p.matcher(url);
             if (m.find()) {
@@ -75,7 +147,6 @@ public class JobExtractorService {
                 if (response != null) {
                     String title = (String) response.getOrDefault("title", "Unknown Position");
                     String companyName = capitalizeWords(company.replace("-", " "));
-
                     return build(url, companyName, title, "Greenhouse", jobId);
                 }
             }
@@ -85,10 +156,9 @@ public class JobExtractorService {
         return extractWithJsoup(url, "Greenhouse");
     }
 
-    // ─── LEVER ───────────────────────────────────────────────────────────────────
+    // ─── LEVER ────────────────────────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractLever(String url) {
         try {
-            // URL format: https://jobs.lever.co/{company}/{jobId}
             Pattern p = Pattern.compile("lever\\.co/([^/]+)/([a-f0-9-]{36})");
             Matcher m = p.matcher(url);
             if (m.find()) {
@@ -111,30 +181,28 @@ public class JobExtractorService {
         return extractWithJsoup(url, "Lever");
     }
 
-    // ─── INDEED ──────────────────────────────────────────────────────────────────
+    // ─── INDEED ───────────────────────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractIndeed(String url) {
         try {
             Pattern p = Pattern.compile("[?&]jk=([a-z0-9]+)");
             Matcher m = p.matcher(url);
-            String jobId = m.find() ? m.group(1) : generateJobId(url);
+            String jobId = m.find() ? m.group(1) : null;
             return extractWithJsoup(url, "Indeed", jobId);
         } catch (Exception e) {
             return extractWithJsoup(url, "Indeed");
         }
     }
 
-    // ─── LINKEDIN ────────────────────────────────────────────────────────────────
+    // ─── LINKEDIN ─────────────────────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractLinkedIn(String url) {
-        // LinkedIn blocks scraping heavily — extract what we can from URL + OG tags
         Pattern p = Pattern.compile("linkedin\\.com/jobs/view/(\\d+)");
         Matcher m = p.matcher(url);
-        String jobId = m.find() ? m.group(1) : generateJobId(url);
+        String jobId = m.find() ? m.group(1) : null;
         return extractWithJsoup(url, "LinkedIn", jobId);
     }
 
-    // ─── SMART RECRUITERS ────────────────────────────────────────────────────────
+    // ─── SMART RECRUITERS ─────────────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractSmartRecruiters(String url) {
-        // URL: https://careers.smartrecruiters.com/{company}/{jobId}
         Pattern p = Pattern.compile("smartrecruiters\\.com/([^/]+)/([^/?]+)");
         Matcher m = p.matcher(url);
         if (m.find()) {
@@ -145,7 +213,53 @@ public class JobExtractorService {
         return extractWithJsoup(url, "SmartRecruiters");
     }
 
-    // ─── GENERIC JSOUP EXTRACTOR ─────────────────────────────────────────────────
+    // ─── HTMLUNIT EXTRACTOR (with JavaScript rendering) ─────────────────────────
+    private String extractWithHtmlUnit(String url) {
+        try (WebClient webClient = new WebClient()) {
+            webClient.getOptions().setJavaScriptEnabled(true);
+            webClient.getOptions().setTimeout(20000);
+            webClient.getOptions().setThrowExceptionOnFailingStatusCode(false);
+            webClient.getOptions().setCssEnabled(false);
+
+            HtmlPage page = webClient.getPage(url);
+
+            // A bot-protection / WAF block page (403, 429, etc) is NOT real job content —
+            // extracting "IDs" from it (e.g. an Akamai error reference number) would be wrong.
+            int statusCode = page.getWebResponse().getStatusCode();
+            if (statusCode >= 400) {
+                log.warn("HtmlUnit got blocked/errored with HTTP {} for {}", statusCode, url);
+                return null;
+            }
+
+            String pageText = page.getBody().getTextContent();
+            log.info("HtmlUnit loaded page, searching for job ID...");
+
+            // Look for explicitly labeled job identifiers in the JS-rendered text
+            String labelGroup = "(?:Job|Requisition|Req|Reference|Ref|Position|Posting|Opening|Vacancy)" +
+                    "\\s*(?:Number|No\\.?|ID|Code|Identification|#)";
+            String valueGroup = "([A-Z0-9][A-Z0-9\\-_\\.]{2,100})";
+            Pattern[] patterns = {
+                Pattern.compile(labelGroup + "\\s*[:\\-]?\\s*" + valueGroup, Pattern.CASE_INSENSITIVE),
+                Pattern.compile(labelGroup + "[\\s\\n]+" + valueGroup, Pattern.CASE_INSENSITIVE | Pattern.MULTILINE)
+            };
+
+            for (Pattern p : patterns) {
+                Matcher m = p.matcher(pageText);
+                if (m.find()) {
+                    String jobId = m.group(1).trim();
+                    if (isValidJobId(jobId)) {
+                        log.info("HtmlUnit found job ID: {}", jobId);
+                        return jobId;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("HtmlUnit extraction failed: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    // ─── JSOUP FULL PAGE EXTRACTOR ────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractWithJsoup(String url, String portalName) {
         return extractWithJsoup(url, portalName, null, null);
     }
@@ -156,51 +270,193 @@ public class JobExtractorService {
 
     private JobDTOs.ExtractedJobData extractWithJsoup(String url, String portalName, String knownJobId, String knownCompany) {
         try {
-            Document doc = Jsoup.connect(url)
+            org.jsoup.Connection.Response response = Jsoup.connect(url)
                     .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                    .timeout(15000)
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Cache-Control", "no-cache")
+                    .header("Upgrade-Insecure-Requests", "1")
+                    .timeout(25000)
                     .followRedirects(true)
-                    .get();
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
+                    .maxBodySize(0)
+                    .execute();
 
-            String title = extractTitle(doc);
-            String company = knownCompany != null ? knownCompany : extractCompany(doc, url);
-            String jobId = knownJobId != null ? knownJobId : extractJobIdFromUrl(url);
+            // Bot-protection / WAF pages (Akamai, Cloudflare, etc) often respond with 403/429
+            // and a generic "Access Denied" page. Treat that as a fetch failure, NOT real content —
+            // otherwise we'd extract garbage (e.g. an Akamai error reference number) as the job ID.
+            if (response.statusCode() >= 400) {
+                throw new IOException("Blocked or errored with HTTP " + response.statusCode());
+            }
+            Document doc = response.parse();
 
+            // ── 1. Try JSON-LD structured data first (most accurate) ──
+            String jsonLdJobId = null;
+            String jsonLdTitle = null;
+            String jsonLdCompany = null;
+
+            Elements scripts = doc.select("script[type=application/ld+json]");
+            for (Element script : scripts) {
+                try {
+                    String json = script.html();
+                    JsonNode node = objectMapper.readTree(json);
+
+                    // Handle arrays
+                    if (node.isArray()) {
+                        for (JsonNode item : node) {
+                            if (isJobPosting(item)) {
+                                jsonLdTitle = getJsonText(item, "title");
+                                jsonLdCompany = getJsonLdCompany(item);
+                                jsonLdJobId = getJsonLdJobId(item);
+                                break;
+                            }
+                        }
+                    } else if (isJobPosting(node)) {
+                        jsonLdTitle = getJsonText(node, "title");
+                        jsonLdCompany = getJsonLdCompany(node);
+                        jsonLdJobId = getJsonLdJobId(node);
+                    }
+
+                    if (jsonLdTitle != null) break;
+                } catch (Exception e) {
+                    // ignore malformed JSON-LD
+                }
+            }
+
+            // ── 2. Extract title ──
+            String title;
+            if (jsonLdTitle != null && !jsonLdTitle.isEmpty()) {
+                title = cleanJobTitle(jsonLdTitle);
+            } else {
+                title = extractTitle(doc);
+            }
+
+            // ── 3. Extract company ──
+            String company;
+            if (knownCompany != null) {
+                company = knownCompany;
+            } else if (jsonLdCompany != null && !jsonLdCompany.isEmpty()) {
+                company = cleanCompanyName(jsonLdCompany);
+            } else {
+                company = extractCompany(doc, url);
+            }
+
+            // ── 4. Extract Job ID — ALWAYS trust explicit page content over URL guesses ──
+            // Priority: labeled page text/meta/schema (Job Number/ID/Reference ID) > JSON-LD
+            //           > JS-rendered content > known URL id > generated hash
+            String jobId = extractJobIdFromPage(doc, url);
+
+            if (jobId == null && jsonLdJobId != null && !jsonLdJobId.isEmpty() && isValidJobId(jsonLdJobId)) {
+                jobId = jsonLdJobId;
+            }
+            if (jobId == null) {
+                // Static HTML had nothing explicit — try rendering JS in case the ID loads dynamically
+                jobId = extractWithHtmlUnit(url);
+            }
+            if (jobId == null && knownJobId != null && isValidJobId(knownJobId)) {
+                // Only trust the URL-derived id when nothing more reliable was found on the page
+                jobId = knownJobId;
+            }
+            if (jobId == null) {
+                // Absolute last resort — guess from URL structure or generate a stable hash
+                jobId = extractJobIdFromUrl(url);
+            }
+
+            log.info("Extracted → title='{}', company='{}', jobId='{}', portal='{}'", title, company, jobId, portalName);
             return build(url, company, title, portalName, jobId);
 
         } catch (IOException e) {
-            log.error("Jsoup fetch failed for {}: {}", url, e.getMessage());
+            // Page fetch itself failed (timeout, redirect loop, bot-blocked, etc).
+            // Fall back to pulling the ID straight out of the URL structure — for many ATS
+            // sites (e.g. Oracle's /job/344317) the URL number IS the real, displayed job ID.
+            log.warn("Jsoup fetch failed for {}: {} — falling back to URL-based extraction", url, e.getMessage());
             String company = knownCompany != null ? knownCompany : extractDomain(url);
-            String jobId = knownJobId != null ? knownJobId : generateJobId(url);
+            String jobId;
+            if (knownJobId != null && isValidJobId(knownJobId)) {
+                jobId = knownJobId;
+            } else {
+                jobId = extractJobIdFromUrl(url); // returns a real URL-derived id, or a JOB-hash as last resort
+            }
             return buildPartial(url, company, "Unknown Position", portalName, jobId);
         }
     }
 
-    // ─── GENERIC FALLBACK ────────────────────────────────────────────────────────
+    // ─── GENERIC FALLBACK ─────────────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractGeneric(String url) {
         return extractWithJsoup(url, detectPortalName(url));
     }
 
-    // ─── HELPER METHODS ──────────────────────────────────────────────────────────
+    // ─── JSON-LD HELPERS ──────────────────────────────────────────────────────────
+
+    private boolean isJobPosting(JsonNode node) {
+        JsonNode type = node.get("@type");
+        if (type == null) return false;
+        String typeStr = type.asText();
+        return typeStr.equals("JobPosting") || typeStr.contains("Job");
+    }
+
+    private String getJsonText(JsonNode node, String field) {
+        JsonNode f = node.get(field);
+        return (f != null && !f.isNull()) ? f.asText().trim() : null;
+    }
+
+    private String getJsonLdCompany(JsonNode node) {
+        // hiringOrganization.name
+        JsonNode org = node.get("hiringOrganization");
+        if (org != null) {
+            JsonNode name = org.get("name");
+            if (name != null && !name.isNull()) return name.asText().trim();
+        }
+        return null;
+    }
+
+    private String getJsonLdJobId(JsonNode node) {
+        // Try "identifier" field (most standard)
+        JsonNode identifier = node.get("identifier");
+        if (identifier != null) {
+            if (identifier.isObject()) {
+                JsonNode val = identifier.get("value");
+                if (val != null && !val.isNull() && !val.asText().isEmpty()) return val.asText().trim();
+                JsonNode name = identifier.get("name");
+                if (name != null && !name.isNull() && !name.asText().isEmpty()) return name.asText().trim();
+            } else if (identifier.isTextual() && !identifier.asText().isEmpty()) {
+                return identifier.asText().trim();
+            }
+        }
+        // Try "jobLocation" > "identifier" — some sites put it here
+        JsonNode url = node.get("url");
+        if (url != null) {
+            // Extract numeric job ID from the URL field in JSON-LD
+            String urlStr = url.asText();
+            Pattern p = Pattern.compile("(?:job[s]?/|jobId=|job_id=|id=|position=)(\\d{4,})");
+            Matcher m = p.matcher(urlStr);
+            if (m.find()) return m.group(1);
+        }
+        return null;
+    }
+
+    // ─── TITLE EXTRACTION ─────────────────────────────────────────────────────────
 
     private String extractTitle(Document doc) {
-        // Try Open Graph title first (most reliable)
+        // 1. Try Open Graph title
         Element ogTitle = doc.selectFirst("meta[property=og:title]");
         if (ogTitle != null && !ogTitle.attr("content").isEmpty()) {
             return cleanJobTitle(ogTitle.attr("content"));
         }
 
-        // Try Twitter card title
+        // 2. Twitter card title
         Element twitterTitle = doc.selectFirst("meta[name=twitter:title]");
         if (twitterTitle != null && !twitterTitle.attr("content").isEmpty()) {
             return cleanJobTitle(twitterTitle.attr("content"));
         }
 
-        // Try common job title selectors
+        // 3. Common job title selectors
         String[] titleSelectors = {
             "h1.job-title", "h1.posting-headline", "h1[class*='title']",
-            "h1[class*='job']", "h1[class*='position']", ".job-header h1",
-            ".posting-title h2", "h1"
+            "h1[class*='job']", "h1[class*='position']", "h1[class*='role']",
+            ".job-header h1", ".posting-title h2", ".job-details h1",
+            "[data-testid*='title']", "[data-automation*='title']", "h1"
         };
         for (String selector : titleSelectors) {
             Element el = doc.selectFirst(selector);
@@ -209,7 +465,7 @@ public class JobExtractorService {
             }
         }
 
-        // Fallback to page title tag
+        // 4. Page title tag
         String pageTitle = doc.title();
         if (!pageTitle.isEmpty()) {
             return cleanJobTitle(pageTitle);
@@ -218,54 +474,215 @@ public class JobExtractorService {
         return "Unknown Position";
     }
 
+    // ─── COMPANY EXTRACTION ───────────────────────────────────────────────────────
+
     private String extractCompany(Document doc, String url) {
-        // Try Open Graph site_name
+        // 1. Open Graph site_name
         Element ogSite = doc.selectFirst("meta[property=og:site_name]");
         if (ogSite != null && !ogSite.attr("content").isEmpty()) {
-            return ogSite.attr("content").trim();
+            return cleanCompanyName(ogSite.attr("content"));
         }
 
-        // Try schema.org
-        Element schemaOrg = doc.selectFirst("meta[itemprop=name]");
-        if (schemaOrg != null && !schemaOrg.attr("content").isEmpty()) {
-            return schemaOrg.attr("content").trim();
+        // 2. Schema.org hiringOrganization
+        Element hiringOrg = doc.selectFirst("[itemprop='hiringOrganization'] [itemprop='name']");
+        if (hiringOrg != null && !hiringOrg.text().trim().isEmpty()) {
+            return cleanCompanyName(hiringOrg.text());
         }
 
-        // Try common company name selectors
+        // 3. Common company selectors
         String[] companySelectors = {
-            ".company-name", "[class*='company']", "[class*='employer']",
-            ".org-name", "[itemprop='hiringOrganization'] [itemprop='name']"
+            ".company-name", "[class*='company-name']", "[class*='employer-name']",
+            "[data-testid*='company']", "[data-automation*='company']",
+            "[itemprop='name']", ".org-name"
         };
         for (String selector : companySelectors) {
             Element el = doc.selectFirst(selector);
             if (el != null && !el.text().trim().isEmpty()) {
-                return el.text().trim();
+                return cleanCompanyName(el.text());
             }
         }
 
-        // Fallback: clean domain name
-        return capitalizeWords(extractDomain(url).replace("careers.", "").replace("jobs.", "")
-                .replaceAll("\\.(com|io|net|org|co).*", "").replace("-", " ").replace(".", " ").trim());
+        // 4. Fallback: clean domain
+        return capitalizeWords(extractDomain(url)
+                .replace("careers.", "").replace("jobs.", "").replace("www.", "")
+                .replaceAll("\\.(com|io|net|org|co|in|us).*", "")
+                .replace("-", " ").replace(".", " ").trim());
+    }
+
+    // ─── JOB ID FROM HTML PAGE ────────────────────────────────────────────────────
+
+    /**
+     * Extract Job ID from the actual HTML page content — NOT just URL.
+     * Tries multiple strategies in priority order.
+     */
+    private String extractJobIdFromPage(Document doc, String url) {
+        // Strategy 0: Look for an explicitly labeled ID in visible page text FIRST (highest priority).
+        // Covers every common label wording seen across ATS platforms:
+        //   Job Number / Job ID / Job Identification / Job Code / Job #
+        //   Requisition ID / Req ID / Req Number
+        //   Reference ID / Reference Number / Reference Code   (e.g. Barclays: "Reference Code: JR-0000118045")
+        //   Position ID / Position Number, Posting ID, Opening ID, Vacancy ID
+        String bodyText = doc.body() != null ? doc.body().text() : "";
+
+        String labelGroup = "(?:Job|Requisition|Req|Reference|Ref|Position|Posting|Opening|Vacancy)" +
+                "\\s*(?:Number|No\\.?|ID|Code|Identification|#)";
+        // Alphanumeric value: letters/digits with optional -, _, . separators (e.g. JR-0000118045, 200043634)
+        String valueGroup = "([A-Z0-9][A-Z0-9\\-_\\.]{2,100})";
+
+        // Label and value on the same line/segment, e.g. "Reference Code: JR-0000118045"
+        Pattern inlinePattern = Pattern.compile(labelGroup + "\\s*[:\\-]?\\s*" + valueGroup, Pattern.CASE_INSENSITIVE);
+        Matcher inlineMatcher = inlinePattern.matcher(bodyText);
+        if (inlineMatcher.find()) {
+            String id = inlineMatcher.group(1).trim();
+            if (isValidJobId(id)) return id;
+        }
+
+        // Label and value stacked on separate lines, e.g. Oracle's "Job Identification\n344317"
+        Pattern stackedPattern = Pattern.compile(labelGroup + "[\\s\\n]+" + valueGroup, Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+        Matcher stackedMatcher = stackedPattern.matcher(bodyText);
+        if (stackedMatcher.find()) {
+            String id = stackedMatcher.group(1).trim();
+            if (isValidJobId(id)) return id;
+        }
+
+        // Strategy 1: Check meta tags for job ID fields
+        String[] jobIdMetaPatterns = {
+            "job[\\s_-]?id", "job[\\s_-]?number", "job[\\s_-]?code", "job[\\s_-]?identification",
+            "req[\\s_-]?id", "req[\\s_-]?number", "requisition[\\s_-]?id",
+            "posting[\\s_-]?id", "position[\\s_-]?id", "reference[\\s_-]?id",
+            "ref[\\s_-]?id", "opening[\\s_-]?id", "vacancy[\\s_-]?id"
+        };
+
+        for (String pattern : jobIdMetaPatterns) {
+            Elements metas = doc.select("meta");
+            for (Element meta : metas) {
+                String name = meta.attr("name").toLowerCase() + meta.attr("property").toLowerCase();
+                if (name.matches(".*(" + pattern + ").*")) {
+                    String content = meta.attr("content").trim();
+                    if (!content.isEmpty() && isValidJobId(content)) return content;
+                }
+            }
+        }
+
+        // Strategy 2: Check data attributes
+        String[] dataAttrs = {"data-job-id", "data-jobid", "data-job_id", "data-req-id",
+                             "data-requisition-id", "data-posting-id", "data-position-id",
+                             "data-ref-id", "data-reference-id", "data-opening-id"};
+        for (String attr : dataAttrs) {
+            Elements els = doc.select("[" + attr + "]");
+            for (Element el : els) {
+                String val = el.attr(attr).trim();
+                if (!val.isEmpty() && isValidJobId(val)) return val;
+            }
+        }
+
+        // Strategy 3: Check hidden input fields
+        Elements hiddenInputs = doc.select("input[type=hidden]");
+        for (Element input : hiddenInputs) {
+            String name = input.attr("name").toLowerCase();
+            String value = input.val().trim();
+            if (!value.isEmpty() && isValidJobId(value) &&
+                (name.contains("jobid") || name.contains("job_id") || name.contains("reqid")
+                    || name.contains("req_id") || name.contains("postingid") || name.contains("positionid")
+                    || name.contains("ref_id") || name.contains("opening_id"))) {
+                return value;
+            }
+        }
+
+        // Strategy 4: Look in structured data / schema markup
+        String schemaJobId = extractFromSchema(doc);
+        if (schemaJobId != null && isValidJobId(schemaJobId)) return schemaJobId;
+
+        // Nothing explicit found in the static HTML — caller will try
+        // JS-rendered content and URL-based guesses as lower-confidence fallbacks.
+        return null;
+    }
+
+    private boolean isValidJobId(String id) {
+        if (id == null || id.isEmpty()) return false;
+        // Accept any alphanumeric ID that's at least 2 characters
+        // Common job IDs: 200043634, 1970393556937574, JR-12345, REQ-001, etc
+        return id.length() >= 2 && id.matches("(?i)[A-Z0-9\\-_]+") &&
+               !id.equalsIgnoreCase("id") &&
+               !id.equalsIgnoreCase("ref") &&
+               !id.equalsIgnoreCase("number");
+    }
+
+    private String extractFromSchema(Document doc) {
+        Elements scripts = doc.select("script[type=application/ld+json]");
+        for (Element script : scripts) {
+            try {
+                String json = script.html();
+                JsonNode node = objectMapper.readTree(json);
+                if (node.isArray()) {
+                    for (JsonNode item : node) {
+                        String id = extractIdFromJsonNode(item);
+                        if (id != null) return id;
+                    }
+                } else {
+                    String id = extractIdFromJsonNode(node);
+                    if (id != null) return id;
+                }
+            } catch (Exception e) {
+                // ignore malformed JSON
+            }
+        }
+        return null;
+    }
+
+    private String extractIdFromJsonNode(JsonNode node) {
+        // Try common fields
+        String[] fields = {"jobId", "job_id", "identifier", "ref", "refId", "ref_id",
+                          "requisitionId", "requisition_id", "positionId", "position_id", "postingId"};
+        for (String field : fields) {
+            JsonNode val = node.get(field);
+            if (val != null && !val.isNull()) {
+                String text = val.asText().trim();
+                if (isValidJobId(text)) return text;
+            }
+        }
+        return null;
     }
 
     private String extractJobIdFromUrl(String url) {
-        // Try numeric ID in last path segment
-        Pattern numericId = Pattern.compile("/(\\d{5,})(?:[/?#]|$)");
-        Matcher m = numericId.matcher(url);
-        if (m.find()) return m.group(1);
+        // Pattern: job/12345, jobs/12345, position/123, req/456, etc
+        Pattern jobPath = Pattern.compile("(?:jobs?|positions?|postings?|vacancies?|req|opening|apply)[/-]([A-Z0-9\\-]{3,30})(?:[/?#]|$)", Pattern.CASE_INSENSITIVE);
+        Matcher m = jobPath.matcher(url);
+        if (m.find()) {
+            String id = m.group(1);
+            if (isValidJobId(id)) return id;
+        }
 
-        // Try UUID
+        // Query params: id=, job_id=, jobId=, req=
+        Pattern qp = Pattern.compile("[?&](?:id|job_?id|req(?:_?id)?|posting_?id|position_?id)=([A-Z0-9\\-_]{3,30})", Pattern.CASE_INSENSITIVE);
+        Matcher mq = qp.matcher(url);
+        if (mq.find()) {
+            String id = mq.group(1);
+            if (isValidJobId(id)) return id;
+        }
+
+        // UUID pattern (commonly used by Lever, etc)
         Pattern uuid = Pattern.compile("([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})");
         Matcher mu = uuid.matcher(url);
         if (mu.find()) return mu.group(1);
 
-        // Try query param jk=
-        Pattern jk = Pattern.compile("[?&]jk=([^&]+)");
-        Matcher mj = jk.matcher(url);
-        if (mj.find()) return mj.group(1);
+        // Long numeric ID anywhere in URL (5+ digits)
+        Pattern numericId = Pattern.compile("/(\\d{5,})(?:[/?#]|$)");
+        Matcher mn = numericId.matcher(url);
+        if (mn.find()) {
+            String id = mn.group(1);
+            if (isValidJobId(id)) return id;
+        }
+
+        // Any 4+ digit number in URL as last resort
+        Pattern anyNumber = Pattern.compile("(\\d{4,})");
+        Matcher any = anyNumber.matcher(url);
+        if (any.find()) return any.group(1);
 
         return generateJobId(url);
     }
+
+    // ─── UTILITIES ────────────────────────────────────────────────────────────────
 
     private String detectPortalName(String url) {
         String domain = extractDomain(url);
@@ -274,17 +691,27 @@ public class JobExtractorService {
         if (domain.contains("linkedin")) return "LinkedIn";
         if (domain.contains("naukri")) return "Naukri";
         if (domain.contains("indeed")) return "Indeed";
-        if (domain.contains("workday")) return "Workday";
+        if (domain.contains("workday") || domain.contains("myworkdayjobs")) return "Workday";
         if (domain.contains("smartrecruiters")) return "SmartRecruiters";
         if (domain.contains("jobvite")) return "Jobvite";
         if (domain.contains("taleo")) return "Taleo";
         if (domain.contains("icims")) return "iCIMS";
+        if (domain.contains("microsoft")) return "Microsoft";
+        if (domain.contains("google")) return "Google";
+        if (domain.contains("amazon")) return "Amazon";
+        if (domain.contains("zoho")) return "Zoho Recruit";
+        if (domain.contains("freshteam") || domain.contains("freshworks")) return "Freshteam";
+        if (domain.contains("keka")) return "Keka";
+        if (domain.contains("darwinbox")) return "Darwinbox";
+        if (domain.contains("successfactors")) return "SAP SuccessFactors";
+        if (domain.contains("brassring") || domain.contains("kenexa")) return "IBM Kenexa";
         return "Company Portal";
     }
 
     private String extractDomain(String url) {
         try {
-            return new URI(url).getHost().toLowerCase();
+            String host = new URI(url).getHost();
+            return host != null ? host.toLowerCase() : url.toLowerCase();
         } catch (URISyntaxException e) {
             return url.toLowerCase();
         }
@@ -295,11 +722,27 @@ public class JobExtractorService {
     }
 
     private String cleanJobTitle(String title) {
-        // Remove common suffixes like "| Company Name", "- Company Name", "at Company"
-        return title.replaceAll("\\s*[|–-].*$", "")
-                    .replaceAll("\\s+at\\s+.*$", "")
-                    .replaceAll("\\s+@\\s+.*$", "")
-                    .trim();
+        if (title == null || title.isEmpty()) return "Unknown Position";
+        String cleaned = org.jsoup.nodes.Entities.unescape(title)
+            .replaceAll("\\s*\\|.*$", "")        // remove "| Company"
+            .replaceAll("\\s*–.*$", "")           // remove "– Company"
+            .replaceAll("(?i)\\s*-\\s*Job\\s*ID.*$", "") // remove "- Job ID: 12345" suffix (Amazon-style)
+            .replaceAll("\\s*-\\s*[A-Z].*$", "") // remove "- Company Name" (starts uppercase)
+            .replaceAll("\\s+at\\s+.*$", "")      // remove "at Company"
+            .replaceAll("\\s+@\\s+.*$", "")       // remove "@ Company"
+            .replaceAll("\\s+in\\s+[A-Z].*$", "") // remove "in City, Country"
+            .trim();
+        return cleaned.isEmpty() ? "Unknown Position" : cleaned;
+    }
+
+    private String cleanCompanyName(String name) {
+        if (name == null || name.trim().isEmpty()) return null;
+        String cleaned = org.jsoup.nodes.Entities.unescape(name.trim());
+        // Strip common site-name suffixes like ".jobs", ".com Careers", " Careers", " Jobs"
+        cleaned = cleaned.replaceAll("(?i)\\.(jobs|careers|com|io|co)$", "")
+                          .replaceAll("(?i)\\s+(careers|jobs)$", "")
+                          .trim();
+        return cleaned.isEmpty() ? name.trim() : cleaned;
     }
 
     private String capitalizeWords(String input) {
