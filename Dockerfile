@@ -9,4 +9,4 @@ FROM eclipse-temurin:8-jre
 WORKDIR /app
 COPY --from=build /app/target/job-tracker-backend-1.0.0.jar app.jar
 EXPOSE 8081
-ENTRYPOINT ["java", "-jar", "app.jar", "--spring.profiles.active=prod"]
+ENTRYPOINT ["java", "-Xms128m", "-Xmx300m", "-XX:MaxMetaspaceSize=100m", "-XX:ReservedCodeCacheSize=32m", "-jar", "app.jar", "--spring.profiles.active=prod"]

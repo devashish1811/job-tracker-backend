@@ -81,13 +81,6 @@
             <version>1.17.2</version>
         </dependency>
 
-        <!-- HtmlUnit for JavaScript rendering -->
-        <dependency>
-            <groupId>net.sourceforge.htmlunit</groupId>
-            <artifactId>htmlunit</artifactId>
-            <version>2.70.0</version>
-        </dependency>
-
         <!-- Lombok -->
         <dependency>
             <groupId>org.projectlombok</groupId>

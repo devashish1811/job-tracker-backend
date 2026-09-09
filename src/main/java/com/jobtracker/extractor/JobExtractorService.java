@@ -11,8 +11,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
-import com.gargoylesoftware.htmlunit.WebClient;
-import com.gargoylesoftware.htmlunit.html.HtmlPage;
 
 import java.io.IOException;
 import java.net.URI;
@@ -213,52 +211,6 @@ public class JobExtractorService {
         return extractWithJsoup(url, "SmartRecruiters");
     }
 
-    // ─── HTMLUNIT EXTRACTOR (with JavaScript rendering) ─────────────────────────
-    private String extractWithHtmlUnit(String url) {
-        try (WebClient webClient = new WebClient()) {
-            webClient.getOptions().setJavaScriptEnabled(true);
-            webClient.getOptions().setTimeout(20000);
-            webClient.getOptions().setThrowExceptionOnFailingStatusCode(false);
-            webClient.getOptions().setCssEnabled(false);
-
-            HtmlPage page = webClient.getPage(url);
-
-            // A bot-protection / WAF block page (403, 429, etc) is NOT real job content —
-            // extracting "IDs" from it (e.g. an Akamai error reference number) would be wrong.
-            int statusCode = page.getWebResponse().getStatusCode();
-            if (statusCode >= 400) {
-                log.warn("HtmlUnit got blocked/errored with HTTP {} for {}", statusCode, url);
-                return null;
-            }
-
-            String pageText = page.getBody().getTextContent();
-            log.info("HtmlUnit loaded page, searching for job ID...");
-
-            // Look for explicitly labeled job identifiers in the JS-rendered text
-            String labelGroup = "(?:Job|Requisition|Req|Reference|Ref|Position|Posting|Opening|Vacancy)" +
-                    "\\s*(?:Number|No\\.?|ID|Code|Identification|#)";
-            String valueGroup = "([A-Z0-9][A-Z0-9\\-_\\.]{2,100})";
-            Pattern[] patterns = {
-                Pattern.compile(labelGroup + "\\s*[:\\-]?\\s*" + valueGroup, Pattern.CASE_INSENSITIVE),
-                Pattern.compile(labelGroup + "[\\s\\n]+" + valueGroup, Pattern.CASE_INSENSITIVE | Pattern.MULTILINE)
-            };
-
-            for (Pattern p : patterns) {
-                Matcher m = p.matcher(pageText);
-                if (m.find()) {
-                    String jobId = m.group(1).trim();
-                    if (isValidJobId(jobId)) {
-                        log.info("HtmlUnit found job ID: {}", jobId);
-                        return jobId;
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.warn("HtmlUnit extraction failed: {}", e.getMessage());
-        }
-        return null;
-    }
-
     // ─── JSOUP FULL PAGE EXTRACTOR ────────────────────────────────────────────────
     private JobDTOs.ExtractedJobData extractWithJsoup(String url, String portalName) {
         return extractWithJsoup(url, portalName, null, null);
@@ -344,15 +296,11 @@ public class JobExtractorService {
 
             // ── 4. Extract Job ID — ALWAYS trust explicit page content over URL guesses ──
             // Priority: labeled page text/meta/schema (Job Number/ID/Reference ID) > JSON-LD
-            //           > JS-rendered content > known URL id > generated hash
+            //           > known URL id > generated hash
             String jobId = extractJobIdFromPage(doc, url);
 
             if (jobId == null && jsonLdJobId != null && !jsonLdJobId.isEmpty() && isValidJobId(jsonLdJobId)) {
                 jobId = jsonLdJobId;
-            }
-            if (jobId == null) {
-                // Static HTML had nothing explicit — try rendering JS in case the ID loads dynamically
-                jobId = extractWithHtmlUnit(url);
             }
             if (jobId == null && knownJobId != null && isValidJobId(knownJobId)) {
                 // Only trust the URL-derived id when nothing more reliable was found on the page
