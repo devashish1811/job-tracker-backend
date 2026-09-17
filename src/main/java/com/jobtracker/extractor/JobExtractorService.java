@@ -93,30 +93,28 @@ public class JobExtractorService {
             // New Microsoft careers site (apply.careers.microsoft.com) is a JS SPA —
             // the internal URL number is NOT the displayed job ID. Call its real
             // JSON API to get the actual "displayJobId" (e.g. 200043634).
+            // Two URL shapes carry this internal id: a path segment (.../job/{id}/...)
+            // or, on search-result deep-links, a "pid={id}" query parameter.
             if (url.contains("apply.careers.microsoft.com")) {
-                Pattern p = Pattern.compile("job/(\\d+)");
-                Matcher m = p.matcher(url);
-                if (m.find()) {
+                Matcher m = Pattern.compile("job/(\\d+)").matcher(url);
+                boolean found = m.find();
+                if (!found) {
+                    m = Pattern.compile("[?&]pid=(\\d+)").matcher(url);
+                    found = m.find();
+                }
+                if (found) {
                     String internalId = m.group(1);
-                    String apiUrl = "https://apply.careers.microsoft.com/api/pcsx/position_details?position_id="
-                            + internalId + "&domain=microsoft.com&hl=en";
-                    try {
-                        @SuppressWarnings("unchecked")
-                        java.util.Map<String, Object> response = restTemplate.getForObject(apiUrl, java.util.Map.class);
-                        if (response != null && response.get("data") instanceof java.util.Map) {
-                            @SuppressWarnings("unchecked")
-                            java.util.Map<String, Object> data = (java.util.Map<String, Object>) response.get("data");
-                            String displayJobId = (String) data.getOrDefault("displayJobId", data.get("atsJobId"));
-                            String title = (String) data.getOrDefault("name", "Unknown Position");
-                            if (displayJobId != null && isValidJobId(displayJobId)) {
-                                log.info("Microsoft API found real job ID: {}", displayJobId);
-                                return build(url, "Microsoft", title, "Microsoft", displayJobId);
-                            }
-                        }
-                    } catch (Exception apiEx) {
-                        log.warn("Microsoft PCSX API failed, falling back to page scrape: {}", apiEx.getMessage());
+
+                    // Try multiple API endpoints to extract the job details
+                    String displayJobId = tryMicrosoftApis(internalId);
+                    if (displayJobId != null && isValidJobId(displayJobId)) {
+                        log.info("Microsoft API found real job ID: {}", displayJobId);
+                        return extractWithJsoup(url, "Microsoft", displayJobId, "Microsoft");
                     }
-                    return extractWithJsoup(url, "Microsoft", null, "Microsoft");
+
+                    // If API fails, try page extraction with the internal ID as fallback
+                    log.warn("Microsoft API couldn't extract displayJobId, using internal ID: {}", internalId);
+                    return extractWithJsoup(url, "Microsoft", internalId, "Microsoft");
                 }
             }
             // Older careers.microsoft.com URLs: https://careers.microsoft.com/us/en/job/1234567/Title
@@ -125,8 +123,92 @@ public class JobExtractorService {
             String jobId = m.find() ? m.group(1) : null;
             return extractWithJsoup(url, "Microsoft", jobId, "Microsoft");
         } catch (Exception e) {
+            log.error("Microsoft extraction failed: {}", e.getMessage());
             return extractWithJsoup(url, "Microsoft");
         }
+    }
+
+    /**
+     * Try multiple Microsoft API endpoints to get the displayJobId.
+     * Returns null if all fail.
+     */
+    private String tryMicrosoftApis(String internalId) {
+        // Try PCSX API (v1)
+        try {
+            String apiUrl = "https://apply.careers.microsoft.com/api/pcsx/position_details?position_id=" + internalId + "&domain=microsoft.com&hl=en";
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> response = restTemplate.getForObject(apiUrl, java.util.Map.class);
+            if (response != null) {
+                Object dataObj = response.get("data");
+                if (dataObj instanceof java.util.Map) {
+                    @SuppressWarnings("unchecked")
+                    java.util.Map<String, Object> data = (java.util.Map<String, Object>) dataObj;
+                    // Try multiple possible field names for the job ID
+                    String displayJobId = (String) data.getOrDefault("displayJobId", null);
+                    if (displayJobId == null) displayJobId = (String) data.getOrDefault("atsJobId", null);
+                    if (displayJobId == null) displayJobId = (String) data.getOrDefault("id", null);
+                    if (displayJobId == null) displayJobId = (String) data.getOrDefault("jobId", null);
+
+                    if (displayJobId != null && isValidJobId(displayJobId)) {
+                        log.debug("PCSX API returned displayJobId: {}", displayJobId);
+                        return displayJobId;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("PCSX API call failed: {}", e.getMessage());
+        }
+
+        // Try alternative API endpoint if PCSX fails
+        try {
+            String altApiUrl = "https://apply.careers.microsoft.com/api/apply/positions/" + internalId;
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> response = restTemplate.getForObject(altApiUrl, java.util.Map.class);
+            if (response != null) {
+                String jobId = extractJobIdFromMap(response);
+                if (jobId != null && isValidJobId(jobId)) {
+                    log.debug("Alternative API returned jobId: {}", jobId);
+                    return jobId;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Alternative API call failed: {}", e.getMessage());
+        }
+
+        return null;
+    }
+
+    /**
+     * Recursively search a map for common job ID field names.
+     */
+    private String extractJobIdFromMap(Object obj) {
+        if (obj instanceof java.util.Map) {
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> map = (java.util.Map<String, Object>) obj;
+
+            // Try direct fields
+            for (String key : new String[]{"displayJobId", "atsJobId", "jobId", "id", "position_id", "positionId"}) {
+                Object val = map.get(key);
+                if (val instanceof String) {
+                    String strVal = (String) val;
+                    if (isValidJobId(strVal)) return strVal;
+                }
+            }
+
+            // Recursively search nested maps
+            for (Object value : map.values()) {
+                String found = extractJobIdFromMap(value);
+                if (found != null) return found;
+            }
+        } else if (obj instanceof java.util.List) {
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> list = (java.util.List<Object>) obj;
+            for (Object item : list) {
+                String found = extractJobIdFromMap(item);
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     // ─── GREENHOUSE ───────────────────────────────────────────────────────────────
@@ -209,6 +291,57 @@ public class JobExtractorService {
             return extractWithJsoup(url, "SmartRecruiters", jobId, company);
         }
         return extractWithJsoup(url, "SmartRecruiters");
+    }
+
+    // ─── MICROSOFT PAGE SPECIFIC EXTRACTION ───────────────────────────────────────
+    private String extractMicrosoftJobIdFromPage(Document doc) {
+        // Try to find job ID in common Microsoft page locations
+
+        // 1. Look in data attributes (React apps often store data there)
+        String[] dataAttrs = {"data-job-id", "data-jobid", "data-position-id", "data-requisition-id",
+                             "data-id", "data-aid", "data-jid", "data-ats-id"};
+        for (String attr : dataAttrs) {
+            Elements els = doc.select("[" + attr + "]");
+            for (Element el : els) {
+                String val = el.attr(attr).trim();
+                if (!val.isEmpty() && isValidJobId(val)) {
+                    log.debug("Found Microsoft job ID in data attribute {}: {}", attr, val);
+                    return val;
+                }
+            }
+        }
+
+        // 2. Look for numeric ID patterns in common Microsoft text patterns
+        String bodyText = doc.body() != null ? doc.body().text() : "";
+        Pattern patterns[] = {
+            Pattern.compile("(?:Job ID|Job #|Posting ID|Position ID|Req ID)[:\\s]+([A-Z0-9\\-_]{3,30})", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("\\b(\\d{8,12})\\b"),  // 8-12 digit numbers (common job IDs)
+        };
+
+        for (Pattern p : patterns) {
+            Matcher m = p.matcher(bodyText);
+            if (m.find()) {
+                String candidate = m.group(1).trim();
+                if (isValidJobId(candidate) && (candidate.length() >= 3 || !candidate.matches("^\\d{1,2}$"))) {
+                    log.debug("Found Microsoft job ID via pattern: {}", candidate);
+                    return candidate;
+                }
+            }
+        }
+
+        // 3. Check hidden input fields (sometimes used in form submissions)
+        Elements hiddenInputs = doc.select("input[type=hidden]");
+        for (Element input : hiddenInputs) {
+            String name = input.attr("name").toLowerCase();
+            String value = input.val().trim();
+            if (!value.isEmpty() && isValidJobId(value) &&
+                (name.contains("jobid") || name.contains("id") || name.contains("aid") || name.contains("position"))) {
+                log.debug("Found Microsoft job ID in hidden input {}: {}", name, value);
+                return value;
+            }
+        }
+
+        return null;
     }
 
     // ─── JSOUP FULL PAGE EXTRACTOR ────────────────────────────────────────────────
@@ -464,6 +597,15 @@ public class JobExtractorService {
      * Tries multiple strategies in priority order.
      */
     private String extractJobIdFromPage(Document doc, String url) {
+        // Microsoft-specific extraction: Look for job ID in common Microsoft elements
+        if (url.contains("microsoft.com")) {
+            String microsoftId = extractMicrosoftJobIdFromPage(doc);
+            if (microsoftId != null && isValidJobId(microsoftId)) {
+                log.debug("Found Microsoft job ID from page: {}", microsoftId);
+                return microsoftId;
+            }
+        }
+
         // Strategy 0: Look for an explicitly labeled ID in visible page text FIRST (highest priority).
         // Covers every common label wording seen across ATS platforms:
         //   Job Number / Job ID / Job Identification / Job Code / Job #
