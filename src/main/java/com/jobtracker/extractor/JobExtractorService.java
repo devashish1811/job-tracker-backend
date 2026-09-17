@@ -84,6 +84,12 @@ public class JobExtractorService {
         if (data.getPositionName() == null || data.getPositionName().equalsIgnoreCase("Unknown Position")) return true;
         if (data.getJobIdFromPortal() == null || data.getJobIdFromPortal().startsWith("JOB-")) return true;
         if (data.getCompanyName() == null || data.getCompanyName().equalsIgnoreCase("Unknown")) return true;
+        // Microsoft's internal position id (16+ digit pid/URL number) is not the real,
+        // human-readable job number — if the API lookup that resolves it failed and we
+        // fell back to that raw internal id, flag it so the user double-checks/completes it.
+        if ("Microsoft".equalsIgnoreCase(data.getPortalName())
+                && data.getJobIdFromPortal() != null
+                && data.getJobIdFromPortal().matches("\\d{13,}")) return true;
         return false;
     }
 
@@ -133,30 +139,40 @@ public class JobExtractorService {
      * Returns null if all fail.
      */
     private String tryMicrosoftApis(String internalId) {
-        // Try PCSX API (v1)
-        try {
-            String apiUrl = "https://apply.careers.microsoft.com/api/pcsx/position_details?position_id=" + internalId + "&domain=microsoft.com&hl=en";
-            @SuppressWarnings("unchecked")
-            java.util.Map<String, Object> response = restTemplate.getForObject(apiUrl, java.util.Map.class);
-            if (response != null) {
-                Object dataObj = response.get("data");
-                if (dataObj instanceof java.util.Map) {
-                    @SuppressWarnings("unchecked")
-                    java.util.Map<String, Object> data = (java.util.Map<String, Object>) dataObj;
-                    // Try multiple possible field names for the job ID
-                    String displayJobId = (String) data.getOrDefault("displayJobId", null);
-                    if (displayJobId == null) displayJobId = (String) data.getOrDefault("atsJobId", null);
-                    if (displayJobId == null) displayJobId = (String) data.getOrDefault("id", null);
-                    if (displayJobId == null) displayJobId = (String) data.getOrDefault("jobId", null);
+        // Try PCSX API (v1) — retry once on 429 (rate limit), since this endpoint
+        // throttles aggressively under back-to-back calls but usually recovers fast.
+        String apiUrl = "https://apply.careers.microsoft.com/api/pcsx/position_details?position_id=" + internalId + "&domain=microsoft.com&hl=en";
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> response = restTemplate.getForObject(apiUrl, java.util.Map.class);
+                if (response != null) {
+                    Object dataObj = response.get("data");
+                    if (dataObj instanceof java.util.Map) {
+                        @SuppressWarnings("unchecked")
+                        java.util.Map<String, Object> data = (java.util.Map<String, Object>) dataObj;
+                        // Try multiple possible field names for the job ID (only the string ones —
+                        // "id" is numeric in this API's response, not usable here)
+                        String displayJobId = (String) data.get("displayJobId");
+                        if (displayJobId == null) displayJobId = (String) data.get("atsJobId");
+                        if (displayJobId == null) displayJobId = (String) data.get("jobId");
 
-                    if (displayJobId != null && isValidJobId(displayJobId)) {
-                        log.debug("PCSX API returned displayJobId: {}", displayJobId);
-                        return displayJobId;
+                        if (displayJobId != null && isValidJobId(displayJobId)) {
+                            log.debug("PCSX API returned displayJobId: {}", displayJobId);
+                            return displayJobId;
+                        }
                     }
                 }
+                break; // got a response, just no usable id in it — no point retrying
+            } catch (org.springframework.web.client.HttpClientErrorException.TooManyRequests e) {
+                log.debug("PCSX API rate-limited (attempt {}/2)", attempt);
+                if (attempt == 1) {
+                    try { Thread.sleep(1500); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                }
+            } catch (Exception e) {
+                log.debug("PCSX API call failed: {}", e.getMessage());
+                break;
             }
-        } catch (Exception e) {
-            log.debug("PCSX API call failed: {}", e.getMessage());
         }
 
         // Try alternative API endpoint if PCSX fails
@@ -311,11 +327,14 @@ public class JobExtractorService {
             }
         }
 
-        // 2. Look for numeric ID patterns in common Microsoft text patterns
+        // 2. Look for an explicitly labeled ID in page text. NOTE: deliberately no bare
+        // "any 8-12 digit number" fallback here — this page embeds plenty of unrelated
+        // 8-12 digit numbers (CDN asset cache-busting timestamps, survey option values,
+        // etc.) in its preloaded JSON state, and a bare digit pattern will grab one of
+        // those instead of the real job id (confirmed: it was matching a CDN timestamp).
         String bodyText = doc.body() != null ? doc.body().text() : "";
         Pattern patterns[] = {
             Pattern.compile("(?:Job ID|Job #|Posting ID|Position ID|Req ID)[:\\s]+([A-Z0-9\\-_]{3,30})", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("\\b(\\d{8,12})\\b"),  // 8-12 digit numbers (common job IDs)
         };
 
         for (Pattern p : patterns) {
@@ -508,9 +527,12 @@ public class JobExtractorService {
         // Try "jobLocation" > "identifier" — some sites put it here
         JsonNode url = node.get("url");
         if (url != null) {
-            // Extract numeric job ID from the URL field in JSON-LD
+            // Extract numeric job ID from the URL field in JSON-LD.
+            // NOTE: "id=" requires a non-letter before it (negative lookbehind) so it
+            // doesn't match as a substring of an unrelated param like "pid=" or "guid="
+            // (confirmed: "pid=1970393556913319" was matching as "id=1970393556913319").
             String urlStr = url.asText();
-            Pattern p = Pattern.compile("(?:job[s]?/|jobId=|job_id=|id=|position=)(\\d{4,})");
+            Pattern p = Pattern.compile("(?:job[s]?/|jobId=|job_id=|(?<![a-zA-Z])id=|position=)(\\d{4,})");
             Matcher m = p.matcher(urlStr);
             if (m.find()) return m.group(1);
         }
@@ -619,8 +641,11 @@ public class JobExtractorService {
         // Alphanumeric value: letters/digits with optional -, _, . separators (e.g. JR-0000118045, 200043634)
         String valueGroup = "([A-Z0-9][A-Z0-9\\-_\\.]{2,100})";
 
-        // Label and value on the same line/segment, e.g. "Reference Code: JR-0000118045"
-        Pattern inlinePattern = Pattern.compile(labelGroup + "\\s*[:\\-]?\\s*" + valueGroup, Pattern.CASE_INSENSITIVE);
+        // Label and value on the same line/segment, e.g. "Reference Code: JR-0000118045".
+        // The label-to-value separator is REQUIRED (whitespace, or a colon/hyphen with
+        // optional space) — an optional/zero-width separator let this over-match plain
+        // English text like "...positionNotification..." as "Position No" + "tification".
+        Pattern inlinePattern = Pattern.compile(labelGroup + "(?:\\s+|\\s*[:\\-]\\s*)" + valueGroup, Pattern.CASE_INSENSITIVE);
         Matcher inlineMatcher = inlinePattern.matcher(bodyText);
         if (inlineMatcher.find()) {
             String id = inlineMatcher.group(1).trim();
